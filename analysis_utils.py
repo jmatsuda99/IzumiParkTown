@@ -94,3 +94,25 @@ def get_pv_profile_for_date(
 
     values = row.iloc[0][pv_time_cols].astype(float).values * factor
     return pd.DataFrame({"time": pv_time_cols, "pv_kw": values})
+
+
+def merge_pv_into_time_series(load_df: pd.DataFrame, pv_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    merged = load_df.copy()
+
+    if pv_df is not None and not pv_df.empty:
+        if "pv_kw" in merged.columns:
+            merged = merged.drop(columns=["pv_kw"])
+        merged = merged.merge(pv_df[["time", "pv_kw"]], on="time", how="left")
+        merged["pv_kw"] = merged["pv_kw"].fillna(0.0)
+    elif "pv_kw" not in merged.columns:
+        merged["pv_kw"] = 0.0
+    else:
+        merged["pv_kw"] = pd.to_numeric(merged["pv_kw"], errors="coerce").fillna(0.0)
+
+    if "kwh" not in merged.columns and "kw" in merged.columns:
+        merged["kwh"] = merged["kw"] * 0.5
+
+    merged["net_kw"] = merged["kw"] - merged["pv_kw"]
+    merged["pv_kwh"] = merged["pv_kw"] * 0.5
+    merged["net_kwh"] = merged["kwh"] - merged["pv_kwh"]
+    return merged

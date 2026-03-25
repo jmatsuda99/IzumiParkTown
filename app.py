@@ -11,6 +11,7 @@ from analysis_utils import (
     build_pv_long_df,
     get_pv_profile_for_date,
     is_holiday_or_weekend,
+    merge_pv_into_time_series,
     prepare_power_views,
 )
 from data_loaders import load_dataset, load_pv_profile_dataset
@@ -493,22 +494,8 @@ class IzumiPowerAnalyzer:
                 target_date,
                 float(self.pv_factor_var.get()),
             )
-            if pv_df is not None:
-                merged = merged.merge(pv_df, on="time", how="left")
-                merged["pv_kw"] = merged["pv_kw"].fillna(0.0)
-                merged["net_kw"] = merged["kw"] - merged["pv_kw"]
-                merged["pv_kwh"] = merged["pv_kw"] * 0.5
-                merged["net_kwh"] = merged["net_kw"] * 0.5
-            else:
-                merged["pv_kw"] = 0.0
-                merged["net_kw"] = merged["kw"]
-                merged["pv_kwh"] = 0.0
-                merged["net_kwh"] = merged["kwh"]
-        else:
-            merged["pv_kw"] = 0.0
-            merged["net_kw"] = merged["kw"]
-            merged["pv_kwh"] = 0.0
-            merged["net_kwh"] = merged["kwh"]
+
+        merged = merge_pv_into_time_series(merged, pv_df)
 
         pv_total_kwh = merged["pv_kwh"].sum()
         pv_max_kw = merged["pv_kw"].max()
@@ -689,8 +676,8 @@ class IzumiPowerAnalyzer:
                 on="time",
                 how="left"
             )
-            merged["pv_kw"] = merged["pv_kw"].fillna(0.0)
-            merged["recv_kw"] = merged["kw"] - merged["pv_kw"]
+            merged = merge_pv_into_time_series(merged, None)
+            merged = merged.rename(columns={"net_kw": "recv_kw", "net_kwh": "recv_kwh"})
             merged = merged.sort_values("sort_key")
 
             load_mean = merged["kw"].mean() if not merged.empty else 0.0
@@ -806,6 +793,7 @@ class IzumiPowerAnalyzer:
                     day_df["sort_key"] = pd.to_datetime(day_df["time"], format="%H:%M", errors="coerce")
                     day_df = day_df.sort_values("sort_key")[["datetime", "date", "time", "kwh", "kw"]].copy()
 
+                    pv_df = None
                     if self.use_pv_var.get() and self.pv_norm_df is not None:
                         pv_df = get_pv_profile_for_date(
                             self.pv_norm_df,
@@ -813,17 +801,8 @@ class IzumiPowerAnalyzer:
                             target_date,
                             float(self.pv_factor_var.get()),
                         )
-                        if pv_df is not None:
-                            day_df = day_df.merge(pv_df, on="time", how="left")
-                            day_df["pv_kw"] = day_df["pv_kw"].fillna(0.0)
-                        else:
-                            day_df["pv_kw"] = 0.0
-                    else:
-                        day_df["pv_kw"] = 0.0
 
-                    day_df["pv_kwh"] = day_df["pv_kw"] * 0.5
-                    day_df["net_kw"] = day_df["kw"] - day_df["pv_kw"]
-                    day_df["net_kwh"] = day_df["kwh"] - day_df["pv_kwh"]
+                    day_df = merge_pv_into_time_series(day_df, pv_df)
 
                     out_name = f"izumi_selected_day_with_pv_{target_date.strftime('%Y%m%d')}.csv"
                     day_df.to_csv(out_dir / out_name, index=False, encoding="utf-8-sig")
