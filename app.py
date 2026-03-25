@@ -52,8 +52,10 @@ def setup_matplotlib_japanese_font():
             break
     plt.rcParams["axes.unicode_minus"] = False
 class IzumiPowerAnalyzer:
-    def __init__(self, root):
-        self.root = root
+    def __init__(self, parent, on_back=None):
+        self.parent = parent
+        self.root = parent.winfo_toplevel()
+        self.on_back = on_back
         self.root.title("Izumi Park Town 30分値解析ツール")
         self.root.geometry("1540x900")
 
@@ -82,11 +84,15 @@ class IzumiPowerAnalyzer:
         self._build_ui()
 
     def _build_ui(self):
-        main = ttk.Frame(self.root, padding=10)
-        main.pack(fill="both", expand=True)
+        self.main = ttk.Frame(self.parent, padding=10)
+        self.main.pack(fill="both", expand=True)
 
-        top = ttk.Frame(main)
+        top = ttk.Frame(self.main)
         top.pack(fill="x")
+
+        if self.on_back is not None:
+            ttk.Button(top, text="ツール選択へ戻る", command=self.on_back).pack(side="left", padx=(0, 8))
+            ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=(0, 8))
 
         ttk.Button(top, text="Excel/ZIP読込→DB保存", command=self.load_file).pack(side="left", padx=4)
         ttk.Button(top, text="DB一覧", command=self.show_db_list).pack(side="left", padx=4)
@@ -114,7 +120,7 @@ class IzumiPowerAnalyzer:
         self.status_var = tk.StringVar(value="未読込")
         ttk.Label(top, textvariable=self.status_var).pack(side="right")
 
-        body = ttk.Panedwindow(main, orient="horizontal")
+        body = ttk.Panedwindow(self.main, orient="horizontal")
         body.pack(fill="both", expand=True, pady=10)
 
         left = ttk.Frame(body, width=460)
@@ -741,8 +747,11 @@ class IzumiPowerAnalyzer:
 
 
 def main():
+    from launcher import ToolLauncher
+    from solar_tool_app import SolarToolApp
+
     root = tk.Tk()
-    app = IzumiPowerAnalyzer(root)
+    ToolLauncher(root, power_tool_cls=IzumiPowerAnalyzer, solar_tool_cls=SolarToolApp)
     root.mainloop()
 
 
