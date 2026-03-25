@@ -780,11 +780,8 @@ class IzumiPowerAnalyzer:
 
 
 def main():
-    from launcher import ToolLauncher
-    from solar_tool_app import SolarToolApp
-
     root = tk.Tk()
-    ToolLauncher(root, power_tool_cls=IzumiPowerAnalyzer, solar_tool_cls=SolarToolApp)
+    IzumiPowerAnalyzer(root)
     root.mainloop()
 
 

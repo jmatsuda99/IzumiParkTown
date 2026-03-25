@@ -1,68 +1,78 @@
 # Izumi Park Town Analysis CLI
 
 ## 概要
-このリポジトリには、用途の異なる 2 系統のツールが含まれています。
+このリポジトリには、同じプロジェクト内で使う 2 つの GUI ツールがあります。
 
-1. `app.py`
-   泉パークタウン向けの 30 分値電力データ解析 GUI アプリ
-2. `extract_solar_type1.py` など
-   NEDO 日射量データを抽出・補完・正規化する補助ツール群
+1. `30分値電力解析ツール`
+   電力データの読込、DB保存、集計、グラフ表示、PV 重ね合わせを行う
+2. `日射量データ処理ツール`
+   NEDO 日射量データの抽出、30分補完、正規化を行う
 
-現在の主アプリは `app.py` です。
+現在は `launcher.py` を正式な起動入口としており、起動時に GUI でツールを選択できます。
 
-## 主アプリ: 30分値電力解析ツール
+## 起動方法
 
-### できること
-- Excel / ZIP の 30 分値電力データを読み込む
-- 読み込んだデータを SQLite (`izumi_power.db`) に保存する
-- 同一ファイルの重複登録をファイルハッシュで回避する
-- 年間概要、平均日負荷、指定日グラフ、月別集計、ヒートマップを表示する
-- 正規化済み PV プロファイル CSV / ZIP を読み込み、疑似 PV と受電点を重ねて表示する
-- 集計結果やグラフ元データを `output/` に CSV 出力する
+### 正式な起動入口
+```bash
+python launcher.py
+```
 
-### 主なファイル
-- `app.py`: メイン GUI アプリ
-- `db.py`: SQLite 初期化、データ保存、読込処理
-- `izumi_power.db`: ローカル保存用データベース
-- `output/`: アプリの CSV 出力先
+### 補助的な単独起動
+電力解析ツールだけを直接開く場合:
 
-### 起動方法
 ```bash
 python app.py
 ```
 
-### 主アプリの入力
+日射量処理ツールだけを直接開く場合:
+
+```bash
+python run_extract_gui.py
+```
+
+## ツール構成
+
+### 1. 30分値電力解析ツール
+
+主なファイル:
+- `app.py`: 電力解析 GUI 本体
+- `db.py`: SQLite 初期化、保存、読込
+- `analysis_utils.py`: 集計・分析用の共通処理
+- `plot_helpers.py`: グラフ描画ヘルパー
+
+できること:
+- Excel / ZIP の 30 分値電力データを読み込む
+- 読み込んだデータを SQLite (`izumi_power.db`) に保存する
+- 年間概要、日別負荷、指定日グラフ、月別集計、ヒートマップを表示する
+- 正規化済み PV プロファイル CSV / ZIP を読み込み、疑似 PV と受電点を重ねて表示する
+- 集計結果やグラフ元データを `output/` に CSV 出力する
+
+入力:
 - 30 分値電力データ: `.xlsx` または `.zip`
 - PV プロファイル: 正規化済み `.csv` または `.zip`
 
-### 主アプリの主な画面機能
-- `年間概要`
-- `日別負荷`
-- `指定日グラフ`
-- `月別集計`
-- `月別 平日/休祝日平均`
-- `ヒートマップ`
-- `月別時刻プロファイル比較`
+### 2. 日射量データ処理ツール
 
-## 補助ツール: NEDO日射量データ処理
+主なファイル:
+- `solar_tool_app.py`: 日射量処理 GUI
+- `solar_processing.py`: 抽出、30分補完、正規化の共通処理
+- `extract_solar_type1.py`: 抽出 CLI
+- `interpolate_solar_30min.py`: 30分補完 CLI
+- `normalize_solar.py`: 正規化 CLI
 
-### 役割
-NEDO 形式の日射量データから、PV プロファイル作成用の中間データを作るためのツール群です。
+できること:
+- NEDO 形式データから `type=1` を抽出
+- 時系列を 30 分値へ補完
+- 全体最大値で正規化
+- GUI から一括実行
 
-### ファイル構成
-- `extract_solar_type1.py`: type=1 の日射量を抽出
-- `interpolate_solar_30min.py`: 30 分値へ補完
-- `normalize_solar.py`: 0〜1 に正規化
-- `run_extract_gui.py`: 抽出だけを GUI で実行する簡易ツール
-
-### 基本手順
+基本手順:
 1. 抽出
 ```bash
 python extract_solar_type1.py <入力> -o test.csv
-python extract_solar_type1.py 日射量データ.zip -o test.csv
 ```
 
-2. 補完
+2. 30分補完
 ```bash
 python interpolate_solar_30min.py test.csv -o test_30min.csv
 ```
@@ -72,12 +82,12 @@ python interpolate_solar_30min.py test.csv -o test_30min.csv
 python normalize_solar.py test_30min.csv -o test_30min_norm.csv
 ```
 
-### 出力イメージ
+出力イメージ:
 - 列構成: `月`, `日`, `0:00`, `0:30`, ..., `23:30`
 - 値: `0` から `1` の正規化値
 
 ## 依存ライブラリ
-`requirements.txt` に以下を記載しています。
+`requirements.txt`
 
 - `pandas`
 - `openpyxl`
@@ -92,6 +102,6 @@ pip install -r requirements.txt
 ```
 
 ## 補足
-- `csv` と `zip` は `.gitignore` で除外しています
+- `csv`、`zip`、`db` は `.gitignore` で除外しています
 - 過去の修正スクリプトやバックアップは `archive/` に退避しています
 - Excel ファイルを開いたままの状態や OneDrive 同期中は、読込に失敗することがあります
