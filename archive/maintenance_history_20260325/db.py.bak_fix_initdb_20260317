@@ -1,0 +1,266 @@
+﻿from pathlib import Path
+import sqlite3
+import hashlib
+import pandas as pd
+
+DB_PATH = Path("izumi_power.db")
+
+
+def get_conn():
+    return sqlite3.connect(DB_PATH)
+
+
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS datasets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_name TEXT NOT NULL,
+        file_hash TEXT NOT NULL UNIQUE,
+        imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        min_datetime TEXT,
+        max_datetime TEXT,
+        record_count INTEGER,
+        total_kwh REAL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS power_30min (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dataset_id INTEGER NOT NULL,
+        datetime TEXT NOT NULL,
+        date TEXT NOT NULL,
+        month TEXT NOT NULL,
+        time TEXT NOT NULL,
+        kwh REAL NOT NULL,
+        UNIQUE(dataset_id, datetime),
+        FOREIGN KEY(dataset_id) REFERENCES datasets(id)
+    )
+    """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_power_dataset_id ON power_30min(dataset_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_power_datetime ON power_30min(datetime)")
+
+    conn.commit()
+    conn.close()
+
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS pv_profile_datasets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_name TEXT NOT NULL,
+        file_hash TEXT NOT NULL UNIQUE,
+        imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        record_count INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS pv_profile_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dataset_id INTEGER NOT NULL,
+        month INTEGER NOT NULL,
+        day INTEGER NOT NULL,
+        time TEXT NOT NULL,
+        norm_value REAL NOT NULL,
+        FOREIGN KEY (dataset_id) REFERENCES pv_profile_datasets(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_pv_profile_records_dataset_id
+    ON pv_profile_records(dataset_id);
+
+    CREATE INDEX IF NOT EXISTS idx_pv_profile_records_month_day_time
+    ON pv_profile_records(month, day, time);
+    """)
+    
+
+
+
+def calc_file_hash(file_path: str) -> str:
+    h = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def dataset_exists(file_hash: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, source_name, imported_at, record_count, total_kwh
+        FROM datasets
+        WHERE file_hash = ?
+    """, (file_hash,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def insert_dataset(source_name: str, file_hash: str, df: pd.DataFrame) -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO datasets (
+            source_name, file_hash, min_datetime, max_datetime, record_count, total_kwh
+        ) VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        source_name,
+        file_hash,
+        str(df["datetime"].min()),
+        str(df["datetime"].max()),
+        int(len(df)),
+        float(df["kwh"].sum())
+    ))
+    dataset_id = cur.lastrowid
+
+    rows = [
+        (
+            dataset_id,
+            str(row.datetime),
+            str(row.date),
+            str(row.month),
+            str(row.time),
+            float(row.kwh)
+        )
+        for row in df.itertuples(index=False)
+    ]
+
+    cur.executemany("""
+        INSERT OR IGNORE INTO power_30min (
+            dataset_id, datetime, date, month, time, kwh
+        ) VALUES (?, ?, ?, ?, ?, ?)
+    """, rows)
+
+    conn.commit()
+    conn.close()
+    return dataset_id
+
+
+def load_dataset_by_id(dataset_id: int) -> pd.DataFrame:
+    conn = get_conn()
+    query = """
+        SELECT datetime, date, month, time, kwh
+        FROM power_30min
+        WHERE dataset_id = ?
+        ORDER BY datetime
+    """
+    df = pd.read_sql_query(query, conn, params=(dataset_id,))
+    conn.close()
+
+    if df.empty:
+        return df
+
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    return df
+
+
+def list_datasets() -> pd.DataFrame:
+    conn = get_conn()
+    df = pd.read_sql_query("""
+        SELECT id, source_name, imported_at, min_datetime, max_datetime, record_count, total_kwh
+        FROM datasets
+        ORDER BY id DESC
+    """, conn)
+    conn.close()
+    return df
+
+
+def pv_dataset_exists(file_hash):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            """
+            SELECT id, source_name, imported_at, record_count
+            FROM pv_profile_datasets
+            WHERE file_hash = ?
+            """,
+            (file_hash,)
+        ).fetchone()
+        return row
+    finally:
+        conn.close()
+
+
+def insert_pv_profile_dataset(source_name, file_hash, pv_df):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            INSERT INTO pv_profile_datasets (source_name, file_hash, record_count)
+            VALUES (?, ?, ?)
+            """,
+            (source_name, file_hash, len(pv_df))
+        )
+        dataset_id = cur.lastrowid
+
+        time_cols = [c for c in pv_df.columns if c not in ["月", "日"]]
+
+        rows = []
+        for _, row in pv_df.iterrows():
+            for t in time_cols:
+                rows.append((
+                    dataset_id,
+                    int(row["月"]),
+                    int(row["日"]),
+                    t,
+                    float(row[t])
+                ))
+
+        cur.executemany(
+            """
+            INSERT INTO pv_profile_records (dataset_id, month, day, time, norm_value)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            rows
+        )
+
+        conn.commit()
+        return dataset_id
+    finally:
+        conn.close()
+
+
+def load_pv_profile_by_id(dataset_id):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT month, day, time, norm_value
+            FROM pv_profile_records
+            WHERE dataset_id = ?
+            ORDER BY month, day, time
+            """,
+            conn,
+            params=(dataset_id,)
+        )
+
+        if df.empty:
+            return pd.DataFrame()
+
+        pivot = df.pivot(index=["month","day"], columns="time", values="norm_value").reset_index()
+        pivot = pivot.rename(columns={"month":"月","day":"日"})
+
+        return pivot
+    finally:
+        conn.close()
+
+
+def load_latest_pv_profile():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT id FROM pv_profile_datasets ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None, pd.DataFrame()
+        dataset_id = row[0]
+    finally:
+        conn.close()
+
+    return dataset_id, load_pv_profile_by_id(dataset_id)
+

@@ -1,0 +1,1071 @@
+﻿import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from pathlib import Path
+import zipfile
+import tempfile
+import pandas as pd
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib import font_manager
+import jpholiday
+
+from db import (
+    init_db,
+    calc_file_hash,
+    dataset_exists,
+    insert_dataset,
+    load_dataset_by_id,
+    list_datasets,
+    pv_dataset_exists,
+    insert_pv_profile_dataset,
+    load_pv_profile_by_id,
+    list_pv_profile_datasets,
+    load_latest_pv_profile,
+)
+
+
+def setup_matplotlib_japanese_font():
+    preferred_fonts = [
+        "Noto Sans CJK JP",
+        "Noto Sans JP",
+        "Yu Gothic",
+        "Meiryo",
+        "MS Gothic",
+        "IPAexGothic",
+        "IPAGothic",
+    ]
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    for font_name in preferred_fonts:
+        if font_name in available:
+            plt.rcParams["font.family"] = font_name
+            break
+    plt.rcParams["axes.unicode_minus"] = False
+
+
+def is_holiday_or_weekend(ts):
+    d = pd.Timestamp(ts).date()
+    return pd.Timestamp(ts).weekday() >= 5 or jpholiday.is_holiday(d)
+
+
+class IzumiPowerAnalyzer:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Izumi Park Town 30分値解析ツール")
+        self.root.geometry("1540x900")
+
+        setup_matplotlib_japanese_font()
+        init_db()
+
+        self.df = None
+        self.daily_df = None
+        self.monthly_df = None
+        self.current_file = None
+        self.current_dataset_id = None
+        self.figure = None
+        self.canvas = None
+        self.current_plot_df = None
+
+        self.pv_norm_df = None
+        self.pv_profile_file = None
+        self.pv_time_cols = []
+        self.pv_factor_var = tk.DoubleVar(value=100.0)
+        self.use_pv_var = tk.BooleanVar(value=True)
+
+        self.show_load_var = tk.BooleanVar(value=True)
+        self.show_pv_profile_var = tk.BooleanVar(value=True)
+        self.show_receive_var = tk.BooleanVar(value=True)
+
+        self._build_ui()
+
+    def _build_ui(self):
+        main = ttk.Frame(self.root, padding=10)
+        main.pack(fill="both", expand=True)
+
+        top = ttk.Frame(main)
+        top.pack(fill="x")
+
+        ttk.Button(top, text="Excel/ZIP読込→DB保存", command=self.load_file).pack(side="left", padx=4)
+        ttk.Button(top, text="DB一覧", command=self.show_db_list).pack(side="left", padx=4)
+        ttk.Button(top, text="最新DBを読込", command=self.load_latest_from_db).pack(side="left", padx=4)
+        ttk.Button(top, text="年間概要", command=self.show_summary).pack(side="left", padx=4)
+        ttk.Button(top, text="日別負荷", command=self.show_daily_profile).pack(side="left", padx=4)
+        ttk.Button(top, text="月別集計", command=self.show_monthly_usage).pack(side="left", padx=4)
+        ttk.Button(top, text="ヒートマップ", command=self.show_heatmap).pack(side="left", padx=4)
+
+        ttk.Label(top, text="日付(YYYY-MM-DD):").pack(side="left", padx=(16, 4))
+        self.date_entry = ttk.Entry(top, width=14)
+        self.date_entry.pack(side="left")
+        ttk.Button(top, text="指定日グラフ", command=self.show_selected_day).pack(side="left", padx=4)
+
+        ttk.Button(top, text="月別 平日/休祝日平均", command=self.show_monthly_weekday_holiday).pack(side="left", padx=4)
+        ttk.Button(top, text="CSV出力", command=self.export_csv).pack(side="left", padx=4)
+
+        ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Button(top, text="PV正規化CSV/ZIP読込", command=self.load_pv_profile_file).pack(side="left", padx=4)
+        ttk.Checkbutton(top, text="PV反映", variable=self.use_pv_var).pack(side="left", padx=(8, 2))
+        ttk.Label(top, text="PV係数:").pack(side="left", padx=(8, 2))
+        self.pv_factor_entry = ttk.Entry(top, textvariable=self.pv_factor_var, width=8)
+        self.pv_factor_entry.pack(side="left")
+
+        self.status_var = tk.StringVar(value="未読込")
+        ttk.Label(top, textvariable=self.status_var).pack(side="right")
+
+        body = ttk.Panedwindow(main, orient="horizontal")
+        body.pack(fill="both", expand=True, pady=10)
+
+        left = ttk.Frame(body, width=460)
+        right = ttk.Frame(body)
+        body.add(left, weight=1)
+        body.add(right, weight=3)
+
+        ttk.Label(left, text="解析結果 / 条件選択", font=("Meiryo UI", 11, "bold")).pack(anchor="w", pady=(0, 6))
+
+        selector = ttk.LabelFrame(left, text="月別時刻プロファイル条件", padding=8)
+        selector.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(selector, text="月（複数選択可）").grid(row=0, column=0, sticky="w")
+        self.month_listbox = tk.Listbox(selector, selectmode="extended", height=8, exportselection=False)
+        self.month_listbox.grid(row=1, column=0, rowspan=4, sticky="nsew", padx=(0, 8), pady=4)
+
+        scrollbar = ttk.Scrollbar(selector, orient="vertical", command=self.month_listbox.yview)
+        scrollbar.grid(row=1, column=1, rowspan=4, sticky="ns", pady=4)
+        self.month_listbox.config(yscrollcommand=scrollbar.set)
+
+        ttk.Label(selector, text="日種別").grid(row=0, column=2, sticky="w")
+        self.daytype_var = tk.StringVar(value="全日")
+        self.daytype_combo = ttk.Combobox(
+            selector,
+            textvariable=self.daytype_var,
+            state="readonly",
+            values=["全日", "平日", "休祝日"],
+            width=12
+        )
+        self.daytype_combo.grid(row=1, column=2, sticky="w", pady=4)
+
+        ttk.Label(selector, text="表示系列").grid(row=2, column=2, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(selector, text="負荷", variable=self.show_load_var).grid(row=3, column=2, sticky="w")
+        ttk.Checkbutton(selector, text="疑似PV", variable=self.show_pv_profile_var).grid(row=4, column=2, sticky="w")
+        ttk.Checkbutton(selector, text="受電点", variable=self.show_receive_var).grid(row=5, column=2, sticky="w")
+
+        ttk.Button(selector, text="選択月プロファイル表示", command=self.show_monthly_time_profile).grid(
+            row=6, column=2, sticky="ew", pady=4
+        )
+        ttk.Button(selector, text="月選択を全解除", command=self.clear_month_selection).grid(
+            row=7, column=2, sticky="ew", pady=4
+        )
+        ttk.Button(selector, text="月を全選択", command=self.select_all_months).grid(
+            row=8, column=2, sticky="ew", pady=4
+        )
+
+        selector.columnconfigure(0, weight=1)
+
+        self.text = tk.Text(left, wrap="word", width=56)
+        self.text.pack(fill="both", expand=True)
+
+        self.plot_frame = ttk.Frame(right)
+        self.plot_frame.pack(fill="both", expand=True)
+
+        self.plot_button_frame = ttk.Frame(right)
+        self.plot_button_frame.pack(fill="x", pady=(6, 0))
+
+        ttk.Button(
+            self.plot_button_frame,
+            text="グラフデータCSV出力",
+            command=self.export_current_plot_csv
+        ).pack(side="left")
+
+    def log(self, msg):
+        self.text.insert("end", msg + "\n")
+        self.text.see("end")
+
+    def export_current_plot_csv(self):
+        if self.current_plot_df is None or self.current_plot_df.empty:
+            messagebox.showwarning("出力不可", "出力できるグラフデータがありません。")
+            return
+
+        out_dir = Path("output")
+        out_dir.mkdir(exist_ok=True)
+
+        if hasattr(self, "current_plot_name") and self.current_plot_name:
+            filename = self.current_plot_name
+        else:
+            filename = "current_plot_data.csv"
+
+        out_path = out_dir / filename
+        self.current_plot_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+        messagebox.showinfo("出力完了", f"グラフデータを {out_path.resolve()} に出力しました。")
+
+    def clear_plot(self):
+        for widget in self.plot_frame.winfo_children():
+            widget.destroy()
+        self.figure = None
+        self.canvas = None
+
+    def draw_figure(self, fig):
+        self.clear_plot()
+        self.figure = fig
+        self.canvas = FigureCanvasTkAgg(fig, master=self.plot_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def refresh_month_listbox(self):
+        self.month_listbox.delete(0, "end")
+        if self.df is None or self.df.empty:
+            return
+        months = sorted(self.df["month"].dropna().unique().tolist())
+        for month in months:
+            self.month_listbox.insert("end", month)
+
+    def select_all_months(self):
+        self.month_listbox.select_set(0, "end")
+
+    def clear_month_selection(self):
+        self.month_listbox.selection_clear(0, "end")
+
+    def get_selected_months(self):
+        idxs = self.month_listbox.curselection()
+        return [self.month_listbox.get(i) for i in idxs]
+
+    def prepare_views(self):
+        self.df["datetime"] = pd.to_datetime(self.df["datetime"])
+        self.df["date_ts"] = self.df["datetime"].dt.normalize()
+        self.df["date"] = self.df["datetime"].dt.date
+        self.df["month"] = self.df["datetime"].dt.to_period("M").astype(str)
+        self.df["time"] = self.df["datetime"].dt.strftime("%H:%M")
+        self.df["kw"] = self.df["kwh"] / 0.5
+        self.df["is_holiday"] = self.df["date_ts"].apply(is_holiday_or_weekend)
+
+        self.daily_df = self._create_daily_totals(self.df)
+        self.monthly_df = self._create_monthly_totals(self.daily_df)
+        self.refresh_month_listbox()
+
+    def load_file(self):
+        path = filedialog.askopenfilename(
+            title="30分値データを選択",
+            filetypes=[("Excel or Zip", "*.xlsx;*.zip"), ("Excel", "*.xlsx"), ("Zip", "*.zip")]
+        )
+        if not path:
+            return
+
+        try:
+            file_hash = calc_file_hash(path)
+            existing = dataset_exists(file_hash)
+
+            self.text.delete("1.0", "end")
+
+            if existing:
+                dataset_id, source_name, imported_at, record_count, total_kwh = existing
+                self.df = load_dataset_by_id(dataset_id)
+                self.current_dataset_id = dataset_id
+                self.current_file = source_name
+                self.prepare_views()
+
+                first_date = self.df["datetime"].min().strftime("%Y-%m-%d")
+                self.date_entry.delete(0, "end")
+                self.date_entry.insert(0, first_date)
+
+                self.status_var.set(f"既存DB読込: dataset_id={dataset_id}")
+                self.log("同一ファイルは既にDB登録済です。")
+                self.log(f"dataset_id: {dataset_id}")
+                self.log(f"source_name: {source_name}")
+                self.log(f"imported_at: {imported_at}")
+                self.log(f"record_count: {record_count}")
+                self.log(f"total_kwh: {total_kwh:,.1f}")
+                self.show_summary()
+                return
+
+            self.current_file = path
+            self.df = self._load_dataset(Path(path))
+            self.prepare_views()
+
+            dataset_id = insert_dataset(Path(path).name, file_hash, self.df)
+            self.current_dataset_id = dataset_id
+
+            first_date = self.df["datetime"].min().strftime("%Y-%m-%d")
+            self.date_entry.delete(0, "end")
+            self.date_entry.insert(0, first_date)
+
+            self.status_var.set(f"新規DB保存: dataset_id={dataset_id}")
+            self.log(f"新規登録完了: {Path(path).name}")
+            self.log(f"dataset_id: {dataset_id}")
+            self.log(f"レコード数: {len(self.df):,}")
+            self.log(f"期間: {self.df['datetime'].min()} ～ {self.df['datetime'].max()}")
+            self.log(f"総使用電力量: {self.df['kwh'].sum():,.1f} kWh")
+
+            self.show_summary()
+
+        except Exception as e:
+            messagebox.showerror("読込エラー", str(e))
+
+    def load_pv_profile_file(self):
+        path = filedialog.askopenfilename(
+            title="正規化PVプロファイルCSV/ZIPを選択",
+            filetypes=[("CSV or Zip", "*.csv;*.zip"), ("CSV", "*.csv"), ("Zip", "*.zip")]
+        )
+        if not path:
+            return
+
+        try:
+            file_hash = calc_file_hash(path)
+            existing = pv_dataset_exists(file_hash)
+
+            self.text.delete("1.0", "end")
+
+            if existing:
+                dataset_id, source_name, imported_at, record_count = existing
+
+                self.pv_norm_df = load_pv_profile_by_id(dataset_id)
+                self.current_pv_dataset_id = dataset_id
+                self.pv_profile_file = source_name
+                self.pv_time_cols = [c for c in self.pv_norm_df.columns if c not in ["月", "日"]]
+
+                self.log("=== PV既存DB読込 ===")
+                self.log(f"id={dataset_id} file={source_name}")
+                self.status_var.set(f"PV DB読込: {dataset_id}")
+                return
+
+            # 新規読込
+            self.pv_norm_df = self._load_pv_profile_dataset(Path(path))
+            self.pv_profile_file = path
+            self.pv_time_cols = [c for c in self.pv_norm_df.columns if c not in ["月", "日"]]
+
+            dataset_id = insert_pv_profile_dataset(
+                Path(path).name,
+                file_hash,
+                self.pv_norm_df
+            )
+
+            self.current_pv_dataset_id = dataset_id
+
+            self.log("=== PV新規DB保存 ===")
+            self.log(f"id={dataset_id}")
+            self.log(f"rows={len(self.pv_norm_df)}")
+
+            self.status_var.set(f"PV保存: {dataset_id}")
+
+        except Exception as e:
+            messagebox.showerror("PV読込エラー", str(e))
+
+    def show_db_list(self):
+        try:
+            df = list_datasets()
+            self.text.delete("1.0", "end")
+            self.log("=== DB登録済みデータ一覧 ===")
+            if df.empty:
+                self.log("登録データはありません。")
+                return
+
+            for row in df.itertuples(index=False):
+                self.log(
+                    f"id={row.id} | {row.source_name} | {row.imported_at} | "
+                    f"{row.record_count}件 | {row.total_kwh:,.1f} kWh"
+                )
+        except Exception as e:
+            messagebox.showerror("DB一覧エラー", str(e))
+
+    def load_latest_from_db(self):
+        try:
+            df_list = list_datasets()
+            if df_list.empty:
+                messagebox.showwarning("DB未登録", "DBにデータがありません。先に読込してください。")
+                return
+
+            dataset_id = int(df_list.iloc[0]["id"])
+            self.df = load_dataset_by_id(dataset_id)
+            self.current_dataset_id = dataset_id
+            self.current_file = df_list.iloc[0]["source_name"]
+            self.prepare_views()
+
+            first_date = self.df["datetime"].min().strftime("%Y-%m-%d")
+            self.date_entry.delete(0, "end")
+            self.date_entry.insert(0, first_date)
+
+            self.status_var.set(f"DB読込: dataset_id={dataset_id}")
+            self.text.delete("1.0", "end")
+            self.log(f"最新DB読込完了: dataset_id={dataset_id}")
+            self.log(f"source_name: {self.current_file}")
+            self.log(f"レコード数: {len(self.df):,}")
+            self.show_summary()
+
+        except Exception as e:
+            messagebox.showerror("DB読込エラー", str(e))
+
+    def _load_dataset(self, path: Path):
+        if path.suffix.lower() == ".zip":
+            with tempfile.TemporaryDirectory() as td:
+                with zipfile.ZipFile(path, "r") as zf:
+                    xlsx_list = [n for n in zf.namelist() if n.lower().endswith(".xlsx")]
+                    if not xlsx_list:
+                        raise ValueError("ZIP内にxlsxが見つかりません。")
+                    xlsx_name = xlsx_list[0]
+                    zf.extract(xlsx_name, td)
+                    xlsx_path = Path(td) / xlsx_name
+                    return self._load_excel(xlsx_path)
+        elif path.suffix.lower() == ".xlsx":
+            return self._load_excel(path)
+        else:
+            raise ValueError("対応形式は .xlsx または .zip です。")
+
+    def _load_pv_profile_dataset(self, path: Path):
+        if path.suffix.lower() == ".zip":
+            with tempfile.TemporaryDirectory() as td:
+                with zipfile.ZipFile(path, "r") as zf:
+                    csv_list = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                    if not csv_list:
+                        raise ValueError("ZIP内にCSVが見つかりません。")
+                    csv_name = csv_list[0]
+                    zf.extract(csv_name, td)
+                    csv_path = Path(td) / csv_name
+                    return self._load_pv_profile_csv(csv_path)
+        elif path.suffix.lower() == ".csv":
+            return self._load_pv_profile_csv(path)
+        else:
+            raise ValueError("PVプロファイルは .csv または .zip に対応しています。")
+
+    def _load_pv_profile_csv(self, path: Path):
+        df = pd.read_csv(path)
+
+        required = {"月", "日"}
+        if not required.issubset(df.columns):
+            raise ValueError("PVプロファイルCSVには '月' と '日' 列が必要です。")
+
+        time_cols = [c for c in df.columns if c not in ["月", "日"]]
+        if len(time_cols) != 48:
+            raise ValueError(f"PVプロファイルCSVの時刻列は48個必要です。現在: {len(time_cols)} 個")
+
+        normalized_map = {}
+        for c in time_cols:
+            try:
+                t = pd.to_datetime(str(c), format="%H:%M", errors="raise")
+                normalized_map[c] = t.strftime("%H:%M")
+            except Exception:
+                try:
+                    hh, mm = str(c).split(":")
+                    normalized_map[c] = f"{int(hh):02d}:{int(mm):02d}"
+                except Exception:
+                    raise ValueError(f"時刻列の形式が不正です: {c}")
+
+        df = df.rename(columns=normalized_map)
+
+        self.pv_time_cols = sorted(
+            [c for c in df.columns if c not in ["月", "日"]],
+            key=lambda x: pd.to_datetime(x, format="%H:%M", errors="coerce")
+        )
+
+        df["月"] = pd.to_numeric(df["月"], errors="coerce").astype("Int64")
+        df["日"] = pd.to_numeric(df["日"], errors="coerce").astype("Int64")
+
+        for c in self.pv_time_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+        df = df.dropna(subset=["月", "日"]).copy()
+        df["月"] = df["月"].astype(int)
+        df["日"] = df["日"].astype(int)
+
+        return df
+
+    def _load_excel(self, path: Path):
+        xls = pd.ExcelFile(path)
+        sheet = xls.sheet_names[0]
+        raw = pd.read_excel(path, sheet_name=sheet, header=None)
+
+        records = []
+        nrows, ncols = raw.shape
+        r = 0
+
+        while r < nrows:
+            row = raw.iloc[r]
+
+            candidate_dates = []
+            for c in range(1, ncols):
+                v = row.iloc[c]
+                try:
+                    if pd.notna(v):
+                        d = pd.to_datetime(v)
+                        if d.year >= 2024 and d.year <= 2030:
+                            candidate_dates.append((c, d.date()))
+                except:
+                    pass
+
+            if len(candidate_dates) >= 5:
+                valid_cols = [c for c, _ in candidate_dates]
+                valid_dates = [d for _, d in candidate_dates]
+
+                for rr in range(r + 1, min(r + 49, nrows)):
+                    t = raw.iloc[rr, 0]
+                    if pd.isna(t):
+                        continue
+
+                    t_str = str(t).strip()
+                    if ":" not in t_str:
+                        continue
+
+                    for idx, c in enumerate(valid_cols):
+                        v = raw.iloc[rr, c]
+                        if pd.isna(v):
+                            continue
+                        try:
+                            d = valid_dates[idx]
+                            if t_str == "24:00":
+                                dt = pd.Timestamp(d) + pd.Timedelta(days=1)
+                            else:
+                                hh, mm = t_str.split(":")
+                                dt = pd.Timestamp(
+                                    year=d.year,
+                                    month=d.month,
+                                    day=d.day,
+                                    hour=int(hh),
+                                    minute=int(mm)
+                                )
+                            records.append([dt, float(v)])
+                        except:
+                            continue
+
+                r += 49
+                continue
+
+            r += 1
+
+        if not records:
+            raise ValueError("30分値データを抽出できませんでした。")
+
+        df = pd.DataFrame(records, columns=["datetime", "kwh"])
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.drop_duplicates(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
+        return df
+
+    def _create_daily_totals(self, df):
+        daily = df.groupby("date_ts", as_index=False)["kwh"].sum()
+        daily["date"] = daily["date_ts"].dt.date
+        daily["month"] = daily["date_ts"].dt.to_period("M").astype(str)
+        daily["is_holiday"] = daily["date_ts"].apply(is_holiday_or_weekend)
+        return daily
+
+    def _create_monthly_totals(self, daily_df):
+        monthly = daily_df.groupby("month", as_index=False)["kwh"].sum()
+        monthly["month_dt"] = pd.to_datetime(monthly["month"] + "-01")
+        monthly = monthly.sort_values("month_dt").reset_index(drop=True)
+        return monthly
+
+    def require_data(self):
+        if self.df is None:
+            messagebox.showwarning("未読込", "先にExcel/ZIP読込またはDB読込を行ってください。")
+            return False
+        return True
+
+
+    def build_pv_long_df(self):
+        if self.pv_norm_df is None or self.pv_norm_df.empty:
+            return pd.DataFrame()
+
+        try:
+            factor = float(self.pv_factor_var.get())
+        except Exception:
+            factor = 100.0
+            self.pv_factor_var.set(factor)
+
+        time_cols = [c for c in self.pv_norm_df.columns if c not in ["月", "日"]]
+        records = []
+
+        for _, row in self.pv_norm_df.iterrows():
+            month = int(row["月"])
+            day = int(row["日"])
+
+            try:
+                dt0 = pd.Timestamp(year=2025, month=month, day=day)
+            except Exception:
+                continue
+
+            is_holiday = is_holiday_or_weekend(dt0)
+
+            for t in time_cols:
+                try:
+                    pv_kw = float(row[t]) * factor
+                except Exception:
+                    pv_kw = 0.0
+
+                records.append({
+                    "month_num": month,
+                    "month": f"2025-{month:02d}",
+                    "day": day,
+                    "time": t,
+                    "pv_kw": pv_kw,
+                    "is_holiday": is_holiday,
+                })
+
+        pv_long = pd.DataFrame(records)
+        if pv_long.empty:
+            return pv_long
+
+        pv_long["sort_key"] = pd.to_datetime(pv_long["time"], format="%H:%M", errors="coerce")
+        return pv_long
+
+    def get_pv_profile_for_date(self, target_date):
+        if self.pv_norm_df is None:
+            return None
+
+        month = target_date.month
+        day = target_date.day
+
+        row = self.pv_norm_df[
+            (self.pv_norm_df["月"] == month) & (self.pv_norm_df["日"] == day)
+        ]
+
+        if row.empty:
+            return None
+
+        try:
+            factor = float(self.pv_factor_var.get())
+        except Exception:
+            factor = 100.0
+            self.pv_factor_var.set(factor)
+
+        values = row.iloc[0][self.pv_time_cols].astype(float).values * factor
+        return pd.DataFrame({
+            "time": self.pv_time_cols,
+            "pv_kw": values
+        })
+
+    def show_summary(self):
+        if not self.require_data():
+            return
+
+        self.text.delete("1.0", "end")
+        total = self.df["kwh"].sum()
+        avg_30m_kw = self.df["kw"].mean()
+        max_30m_kw = self.df["kw"].max()
+        min_30m_kw = self.df["kw"].min()
+        avg_day = self.daily_df["kwh"].mean()
+        max_day = self.daily_df["kwh"].max()
+        min_day = self.daily_df["kwh"].min()
+
+        self.log("=== 年間概要 ===")
+        self.log(f"dataset_id: {self.current_dataset_id}")
+        self.log(f"ソース: {self.current_file}")
+        self.log(f"期間: {self.df['datetime'].min()} ～ {self.df['datetime'].max()}")
+        self.log(f"総使用電力量: {total:,.1f} kWh")
+        self.log(f"30分平均: {avg_30m_kw:,.2f} kW")
+        self.log(f"30分最大: {max_30m_kw:,.2f} kW")
+        self.log(f"30分最小: {min_30m_kw:,.2f} kW")
+        self.log(f"日平均: {avg_day:,.2f} kWh/日")
+        self.log(f"日最大: {max_day:,.2f} kWh/日")
+        self.log(f"日最小: {min_day:,.2f} kWh/日")
+
+        plot_y = (self.daily_df["kwh"] / 48.0) / 0.5
+
+        self.current_plot_df = pd.DataFrame({
+            "日付": self.daily_df["date_ts"],
+            "日平均需要電力_kW": plot_y
+        })
+        self.current_plot_name = "annual_summary_daily_average_kw.csv"
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(self.daily_df["date_ts"], plot_y)
+        ax.set_title("日平均需要電力")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("kW")
+        ax.grid(True)
+        fig.tight_layout()
+        self.draw_figure(fig)
+
+    def show_daily_profile(self):
+        if not self.require_data():
+            return
+
+        profile = self.df.groupby("time", as_index=False)["kw"].mean()
+        profile["sort_key"] = pd.to_datetime(profile["time"], format="%H:%M", errors="coerce")
+        profile = profile.sort_values("sort_key")
+
+        self.text.delete("1.0", "end")
+        self.log("=== 平均日負荷カーブ ===")
+        for _, row in profile.head(10).iterrows():
+            self.log(f"{row['time']} : {row['kw']:.2f} kW")
+
+        fig, ax = plt.subplots(figsize=(11, 5))
+        ax.plot(profile["time"], profile["kw"])
+        ax.set_title("平均日負荷カーブ")
+        ax.set_xlabel("Time")
+        ax.set_ylabel("kW")
+        ax.tick_params(axis="x", rotation=90)
+        ax.grid(True)
+        fig.tight_layout()
+        self.draw_figure(fig)
+
+    def show_selected_day(self):
+        if not self.require_data():
+            return
+
+        date_str = self.date_entry.get().strip()
+        if not date_str:
+            messagebox.showwarning("日付未入力", "YYYY-MM-DD 形式で日付を入力してください。")
+            return
+
+        try:
+            target_date = pd.to_datetime(date_str).date()
+        except Exception:
+            messagebox.showerror("日付エラー", "日付形式は YYYY-MM-DD で入力してください。")
+            return
+
+        work = self.df[self.df["date"] == target_date].copy()
+        if work.empty:
+            messagebox.showwarning("データなし", f"{date_str} のデータはありません。")
+            return
+
+        work["sort_key"] = pd.to_datetime(work["time"], format="%H:%M", errors="coerce")
+        work = work.sort_values("sort_key")
+
+        day_total_kwh = work["kwh"].sum()
+        day_avg_kw = work["kw"].mean()
+        day_max_kw = work["kw"].max()
+        holiday_label = "休祝日" if is_holiday_or_weekend(pd.Timestamp(target_date)) else "平日"
+
+        pv_df = None
+        merged = work[["time", "kw", "kwh"]].copy()
+
+        if self.use_pv_var.get() and self.pv_norm_df is not None:
+            pv_df = self.get_pv_profile_for_date(target_date)
+            if pv_df is not None:
+                merged = merged.merge(pv_df, on="time", how="left")
+                merged["pv_kw"] = merged["pv_kw"].fillna(0.0)
+                merged["net_kw"] = merged["kw"] - merged["pv_kw"]
+                merged["pv_kwh"] = merged["pv_kw"] * 0.5
+                merged["net_kwh"] = merged["net_kw"] * 0.5
+            else:
+                merged["pv_kw"] = 0.0
+                merged["net_kw"] = merged["kw"]
+                merged["pv_kwh"] = 0.0
+                merged["net_kwh"] = merged["kwh"]
+        else:
+            merged["pv_kw"] = 0.0
+            merged["net_kw"] = merged["kw"]
+            merged["pv_kwh"] = 0.0
+            merged["net_kwh"] = merged["kwh"]
+
+        pv_total_kwh = merged["pv_kwh"].sum()
+        pv_max_kw = merged["pv_kw"].max()
+        net_total_kwh = merged["net_kwh"].sum()
+        net_max_kw = merged["net_kw"].max()
+
+        self.text.delete("1.0", "end")
+        self.log(f"=== 指定日グラフ: {date_str} ===")
+        self.log(f"区分: {holiday_label}")
+        self.log(f"日使用電力量: {day_total_kwh:,.1f} kWh")
+        self.log(f"平均需要電力: {day_avg_kw:,.2f} kW")
+        self.log(f"最大需要電力: {day_max_kw:,.2f} kW")
+
+        if self.use_pv_var.get() and self.pv_norm_df is not None:
+            self.log(f"PV係数: {float(self.pv_factor_var.get()):,.2f}")
+            self.log(f"疑似PV発電量: {pv_total_kwh:,.1f} kWh")
+            self.log(f"疑似PV最大出力: {pv_max_kw:,.2f} kW")
+            self.log(f"差引後ネット電力量: {net_total_kwh:,.1f} kWh")
+            self.log(f"差引後ネット最大需要: {net_max_kw:,.2f} kW")
+
+            if pv_df is None:
+                self.log("※ PVプロファイルに該当する月日がないため、PVは反映されていません。")
+
+        self.current_plot_df = merged[["time", "kw", "pv_kw", "net_kw"]].copy()
+        self.current_plot_df = self.current_plot_df.rename(columns={
+            "time": "時刻",
+            "kw": "負荷_kW",
+            "pv_kw": "疑似PV_kW",
+            "net_kw": "受電点_kW",
+        })
+        self.current_plot_name = f"selected_day_profile_{date_str.replace('-', '')}.csv"
+
+        fig, ax = plt.subplots(figsize=(11, 5))
+        ax.plot(merged["time"], merged["kw"], marker="o", markersize=2, label="需要(kW)")
+
+        if self.use_pv_var.get() and self.pv_norm_df is not None:
+            ax.plot(merged["time"], merged["pv_kw"], marker="o", markersize=2, label="疑似PV(kW)")
+            ax.plot(merged["time"], merged["net_kw"], marker="o", markersize=2, label="ネット需要(kW)")
+
+        ax.set_title(f"指定日需要電力: {date_str}")
+        ax.set_xlabel("Time")
+        ax.set_ylabel("kW")
+        ax.tick_params(axis="x", rotation=90)
+        ax.grid(True)
+        ax.legend()
+        fig.tight_layout()
+        self.draw_figure(fig)
+
+    def show_monthly_usage(self):
+        if not self.require_data():
+            return
+
+        self.text.delete("1.0", "end")
+        self.log("=== 月別使用電力量 ===")
+        for _, row in self.monthly_df.iterrows():
+            self.log(f"{row['month']} : {row['kwh']:,.1f} kWh")
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.bar(self.monthly_df["month"], self.monthly_df["kwh"])
+        ax.set_title("月別使用電力量")
+        ax.set_xlabel("Month")
+        ax.set_ylabel("kWh")
+        ax.tick_params(axis="x", rotation=45)
+        fig.tight_layout()
+        self.draw_figure(fig)
+
+    def show_monthly_weekday_holiday(self):
+        if not self.require_data():
+            return
+
+        daily = self.daily_df.copy()
+        daily["day_type"] = daily["is_holiday"].map({False: "平日", True: "休祝日"})
+
+        summary = (
+            daily.groupby(["month", "day_type"], as_index=False)["kwh"]
+            .mean()
+            .rename(columns={"kwh": "avg_kwh_per_day"})
+        )
+        summary["avg_kw"] = (summary["avg_kwh_per_day"] / 48.0) / 0.5
+
+        pivot = summary.pivot(index="month", columns="day_type", values="avg_kw").fillna(0.0)
+        pivot = pivot.sort_index()
+
+        months = list(pivot.index)
+        weekday_vals = pivot["平日"] if "平日" in pivot.columns else pd.Series([0]*len(months), index=months)
+        holiday_vals = pivot["休祝日"] if "休祝日" in pivot.columns else pd.Series([0]*len(months), index=months)
+
+        self.text.delete("1.0", "end")
+        self.log("=== 月別 平日/休祝日平均需要電力 ===")
+        for month in months:
+            wk = float(weekday_vals.loc[month]) if month in weekday_vals.index else 0.0
+            hd = float(holiday_vals.loc[month]) if month in holiday_vals.index else 0.0
+            self.log(f"{month} | 平日: {wk:,.2f} kW | 休祝日: {hd:,.2f} kW")
+
+        x = range(len(months))
+        width = 0.38
+
+        fig, ax = plt.subplots(figsize=(12, 5))
+        ax.bar([i - width/2 for i in x], weekday_vals.values, width=width, label="平日")
+        ax.bar([i + width/2 for i in x], holiday_vals.values, width=width, label="休祝日")
+        ax.set_title("月別 平日/休祝日 平均需要電力")
+        ax.set_xlabel("Month")
+        ax.set_ylabel("kW")
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(months, rotation=45)
+        ax.legend()
+        fig.tight_layout()
+        self.draw_figure(fig)
+
+    def show_monthly_time_profile(self):
+        if not self.require_data():
+            return
+
+        selected_months = self.get_selected_months()
+        if not selected_months:
+            messagebox.showwarning("月未選択", "月を1つ以上選択してください。")
+            return
+
+        if not (self.show_load_var.get() or self.show_pv_profile_var.get() or self.show_receive_var.get()):
+            messagebox.showwarning("表示未選択", "負荷・疑似PV・受電点のいずれかを選択してください。")
+            return
+
+        daytype = self.daytype_var.get()
+
+        load_work = self.df.copy()
+        if daytype == "平日":
+            load_work = load_work[load_work["is_holiday"] == False]
+        elif daytype == "休祝日":
+            load_work = load_work[load_work["is_holiday"] == True]
+        load_work = load_work[load_work["month"].isin(selected_months)].copy()
+
+        load_profile = (
+            load_work.groupby(["month", "time"], as_index=False)["kw"]
+            .mean()
+        )
+        load_profile["sort_key"] = pd.to_datetime(load_profile["time"], format="%H:%M", errors="coerce")
+
+        pv_profile = pd.DataFrame(columns=["month", "time", "pv_kw", "sort_key"])
+        if self.pv_norm_df is not None and not self.pv_norm_df.empty:
+            pv_long = self.build_pv_long_df()
+
+            if not pv_long.empty:
+                if daytype == "平日":
+                    pv_long = pv_long[pv_long["is_holiday"] == False]
+                elif daytype == "休祝日":
+                    pv_long = pv_long[pv_long["is_holiday"] == True]
+
+                pv_long = pv_long[pv_long["month"].isin(selected_months)].copy()
+
+                if not pv_long.empty:
+                    pv_profile = (
+                        pv_long.groupby(["month", "time"], as_index=False)["pv_kw"]
+                        .mean()
+                    )
+                    pv_profile["sort_key"] = pd.to_datetime(pv_profile["time"], format="%H:%M", errors="coerce")
+
+        self.text.delete("1.0", "end")
+        self.log("=== 月別時刻プロファイル比較 ===")
+        self.log(f"日種別: {daytype}")
+        self.log(f"対象月: {', '.join(selected_months)}")
+        self.log(
+            f"表示: "
+            f"{'負荷 ' if self.show_load_var.get() else ''}"
+            f"{'疑似PV ' if self.show_pv_profile_var.get() else ''}"
+            f"{'受電点' if self.show_receive_var.get() else ''}"
+        )
+
+        fig, ax = plt.subplots(figsize=(13, 6))
+        export_rows = []
+
+        for month in selected_months:
+            load_sub = load_profile[load_profile["month"] == month].copy().sort_values("sort_key")
+            pv_sub = pv_profile[pv_profile["month"] == month].copy().sort_values("sort_key")
+
+            merged = pd.merge(
+                load_sub[["time", "kw", "sort_key"]],
+                pv_sub[["time", "pv_kw"]],
+                on="time",
+                how="left"
+            )
+            merged["pv_kw"] = merged["pv_kw"].fillna(0.0)
+            merged["recv_kw"] = merged["kw"] - merged["pv_kw"]
+            merged = merged.sort_values("sort_key")
+
+            load_mean = merged["kw"].mean() if not merged.empty else 0.0
+            pv_mean = merged["pv_kw"].mean() if not merged.empty else 0.0
+            recv_mean = merged["recv_kw"].mean() if not merged.empty else 0.0
+
+            self.log(
+                f"{month} | 負荷平均: {load_mean:,.2f} kW | "
+                f"疑似PV平均: {pv_mean:,.2f} kW | "
+                f"受電点平均: {recv_mean:,.2f} kW"
+            )
+
+            export_sub = merged[["time", "kw", "pv_kw", "recv_kw"]].copy()
+            export_sub["month"] = month
+            export_rows.append(export_sub[["month", "time", "kw", "pv_kw", "recv_kw"]])
+
+            if self.show_load_var.get():
+                ax.plot(merged["time"], merged["kw"], label=f"{month} 負荷")
+
+            if self.show_pv_profile_var.get():
+                ax.plot(merged["time"], merged["pv_kw"], label=f"{month} 疑似PV")
+
+            if self.show_receive_var.get():
+                ax.plot(merged["time"], merged["recv_kw"], label=f"{month} 受電点")
+
+        if export_rows:
+            self.current_plot_df = pd.concat(export_rows, ignore_index=True)
+            self.current_plot_df = self.current_plot_df.rename(columns={
+                "month": "月",
+                "time": "時刻",
+                "kw": "負荷_kW",
+                "pv_kw": "疑似PV_kW",
+                "recv_kw": "受電点_kW",
+            })
+            self.current_plot_name = "monthly_time_profile_with_pv.csv"
+        else:
+            self.current_plot_df = None
+            self.current_plot_name = None
+
+        ax.set_title(f"月別時刻プロファイル比較（{daytype}）")
+        ax.set_xlabel("Time")
+        ax.set_ylabel("kW")
+        ax.tick_params(axis="x", rotation=90)
+        ax.grid(True)
+        ax.legend()
+        fig.tight_layout()
+        self.draw_figure(fig)
+
+    def show_heatmap(self):
+        if not self.require_data():
+            return
+
+        work = self.df.copy()
+        work["date_str"] = work["datetime"].dt.strftime("%Y-%m-%d")
+        pivot = work.pivot_table(index="time", columns="date_str", values="kw", aggfunc="mean")
+        pivot = pivot.sort_index()
+
+        self.text.delete("1.0", "end")
+        self.log("=== 30分値ヒートマップ ===")
+        self.log(f"行数: {pivot.shape[0]}")
+        self.log(f"列数: {pivot.shape[1]}")
+
+        fig, ax = plt.subplots(figsize=(14, 6))
+        im = ax.imshow(pivot.values, aspect="auto", interpolation="nearest")
+        ax.set_title("30分値需要電力ヒートマップ")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Time")
+        ax.set_yticks(range(len(pivot.index)))
+        ax.set_yticklabels(pivot.index)
+        fig.colorbar(im, ax=ax, label="kW")
+        fig.tight_layout()
+        self.draw_figure(fig)
+
+    def export_csv(self):
+        if not self.require_data():
+            return
+
+        out_dir = Path("output")
+        out_dir.mkdir(exist_ok=True)
+
+        export_df = self.df.copy()
+
+        export_daily = self.daily_df.copy()
+        export_daily["avg_kw"] = (export_daily["kwh"] / 48.0) / 0.5
+
+        monthly_daytype = self.daily_df.copy()
+        monthly_daytype["day_type"] = monthly_daytype["is_holiday"].map({False: "平日", True: "休祝日"})
+        monthly_daytype = (
+            monthly_daytype.groupby(["month", "day_type"], as_index=False)["kwh"]
+            .mean()
+            .rename(columns={"kwh": "avg_kwh_per_day"})
+        )
+        monthly_daytype["avg_kw"] = (monthly_daytype["avg_kwh_per_day"] / 48.0) / 0.5
+
+        monthly_time_profile = (
+            self.df.groupby(["month", "is_holiday", "time"], as_index=False)["kw"]
+            .mean()
+        )
+        monthly_time_profile["day_type"] = monthly_time_profile["is_holiday"].map({False: "平日", True: "休祝日"})
+
+        export_df.to_csv(out_dir / "izumi_30min_long_with_kw.csv", index=False, encoding="utf-8-sig")
+        export_daily.to_csv(out_dir / "izumi_daily_totals.csv", index=False, encoding="utf-8-sig")
+        self.monthly_df.to_csv(out_dir / "izumi_monthly_totals.csv", index=False, encoding="utf-8-sig")
+        monthly_daytype.to_csv(out_dir / "izumi_monthly_weekday_holiday_avg.csv", index=False, encoding="utf-8-sig")
+        monthly_time_profile.to_csv(out_dir / "izumi_monthly_time_profile.csv", index=False, encoding="utf-8-sig")
+
+        date_str = self.date_entry.get().strip()
+        if date_str:
+            try:
+                target_date = pd.to_datetime(date_str).date()
+                day_df = self.df[self.df["date"] == target_date].copy()
+                if not day_df.empty:
+                    day_df["sort_key"] = pd.to_datetime(day_df["time"], format="%H:%M", errors="coerce")
+                    day_df = day_df.sort_values("sort_key")[["datetime", "date", "time", "kwh", "kw"]].copy()
+
+                    if self.use_pv_var.get() and self.pv_norm_df is not None:
+                        pv_df = self.get_pv_profile_for_date(target_date)
+                        if pv_df is not None:
+                            day_df = day_df.merge(pv_df, on="time", how="left")
+                            day_df["pv_kw"] = day_df["pv_kw"].fillna(0.0)
+                        else:
+                            day_df["pv_kw"] = 0.0
+                    else:
+                        day_df["pv_kw"] = 0.0
+
+                    day_df["pv_kwh"] = day_df["pv_kw"] * 0.5
+                    day_df["net_kw"] = day_df["kw"] - day_df["pv_kw"]
+                    day_df["net_kwh"] = day_df["kwh"] - day_df["pv_kwh"]
+
+                    out_name = f"izumi_selected_day_with_pv_{target_date.strftime('%Y%m%d')}.csv"
+                    day_df.to_csv(out_dir / out_name, index=False, encoding="utf-8-sig")
+            except Exception:
+                pass
+
+        messagebox.showinfo("出力完了", f"CSVを {out_dir.resolve()} に出力しました。")
+
+
+def main():
+    root = tk.Tk()
+    app = IzumiPowerAnalyzer(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
