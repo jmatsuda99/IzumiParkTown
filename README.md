@@ -105,3 +105,6 @@ pip install -r requirements.txt
 - `csv`、`zip`、`db` は `.gitignore` で除外しています
 - 過去の修正スクリプトやバックアップは `archive/` に退避しています
 - Excel ファイルを開いたままの状態や OneDrive 同期中は、読込に失敗することがあります
+
+## 変更後の確認
+変更後の最低限の確認手順は [docs/regression_checklist.md](/d:/Deltabox/OneDrive%20-%20Delta%20Electronics,%20Inc/020_TOOL/070_IzumiParkTown/izumi_park_analysis_cli/docs/regression_checklist.md) にまとめています。
