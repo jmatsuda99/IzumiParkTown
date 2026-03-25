@@ -14,6 +14,13 @@ from analysis_utils import (
     prepare_power_views,
 )
 from data_loaders import load_dataset, load_pv_profile_dataset
+from plot_helpers import (
+    create_bar_plot,
+    create_grouped_bar_plot,
+    create_heatmap_plot,
+    create_line_plot,
+    create_multi_line_plot,
+)
 
 from db import (
     init_db,
@@ -423,13 +430,14 @@ class IzumiPowerAnalyzer:
         })
         self.current_plot_name = "annual_summary_daily_average_kw.csv"
 
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.plot(self.daily_df["date_ts"], plot_y)
-        ax.set_title("日平均需要電力")
-        ax.set_xlabel("Date")
-        ax.set_ylabel("kW")
-        ax.grid(True)
-        fig.tight_layout()
+        fig, _ = create_line_plot(
+            self.daily_df["date_ts"],
+            plot_y,
+            title="日平均需要電力",
+            xlabel="Date",
+            ylabel="kW",
+            figsize=(10, 5),
+        )
         self.draw_figure(fig)
 
     def show_daily_profile(self):
@@ -445,14 +453,15 @@ class IzumiPowerAnalyzer:
         for _, row in profile.head(10).iterrows():
             self.log(f"{row['time']} : {row['kw']:.2f} kW")
 
-        fig, ax = plt.subplots(figsize=(11, 5))
-        ax.plot(profile["time"], profile["kw"])
-        ax.set_title("平均日負荷カーブ")
-        ax.set_xlabel("Time")
-        ax.set_ylabel("kW")
-        ax.tick_params(axis="x", rotation=90)
-        ax.grid(True)
-        fig.tight_layout()
+        fig, _ = create_line_plot(
+            profile["time"],
+            profile["kw"],
+            title="平均日負荷カーブ",
+            xlabel="Time",
+            ylabel="kW",
+            figsize=(11, 5),
+            rotation=90,
+        )
         self.draw_figure(fig)
 
     def show_selected_day(self):
@@ -508,20 +517,21 @@ class IzumiPowerAnalyzer:
         })
         self.current_plot_name = f"selected_day_profile_{date_str.replace('-', '')}.csv"
 
-        fig, ax = plt.subplots(figsize=(11, 5))
-        ax.plot(merged["time"], merged["kw"], marker="o", markersize=2, label="需要(kW)")
-
+        series = [{"x": merged["time"], "y": merged["kw"], "label": "需要(kW)"}]
         if self.use_pv_var.get() and self.pv_norm_df is not None:
-            ax.plot(merged["time"], merged["pv_kw"], marker="o", markersize=2, label="疑似PV(kW)")
-            ax.plot(merged["time"], merged["net_kw"], marker="o", markersize=2, label="ネット需要(kW)")
+            series.append({"x": merged["time"], "y": merged["pv_kw"], "label": "疑似PV(kW)"})
+            series.append({"x": merged["time"], "y": merged["net_kw"], "label": "ネット需要(kW)"})
 
-        ax.set_title(f"指定日需要電力: {date_str}")
-        ax.set_xlabel("Time")
-        ax.set_ylabel("kW")
-        ax.tick_params(axis="x", rotation=90)
-        ax.grid(True)
-        ax.legend()
-        fig.tight_layout()
+        fig, _ = create_multi_line_plot(
+            series,
+            title=f"指定日需要電力: {date_str}",
+            xlabel="Time",
+            ylabel="kW",
+            figsize=(11, 5),
+            rotation=90,
+            marker="o",
+            markersize=2,
+        )
         self.draw_figure(fig)
 
     def show_monthly_usage(self):
@@ -533,13 +543,15 @@ class IzumiPowerAnalyzer:
         for _, row in self.monthly_df.iterrows():
             self.log(f"{row['month']} : {row['kwh']:,.1f} kWh")
 
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.bar(self.monthly_df["month"], self.monthly_df["kwh"])
-        ax.set_title("月別使用電力量")
-        ax.set_xlabel("Month")
-        ax.set_ylabel("kWh")
-        ax.tick_params(axis="x", rotation=45)
-        fig.tight_layout()
+        fig, _ = create_bar_plot(
+            self.monthly_df["month"],
+            self.monthly_df["kwh"],
+            title="月別使用電力量",
+            xlabel="Month",
+            ylabel="kWh",
+            figsize=(10, 5),
+            rotation=45,
+        )
         self.draw_figure(fig)
 
     def show_monthly_weekday_holiday(self):
@@ -570,19 +582,19 @@ class IzumiPowerAnalyzer:
             hd = float(holiday_vals.loc[month]) if month in holiday_vals.index else 0.0
             self.log(f"{month} | 平日: {wk:,.2f} kW | 休祝日: {hd:,.2f} kW")
 
-        x = range(len(months))
-        width = 0.38
-
-        fig, ax = plt.subplots(figsize=(12, 5))
-        ax.bar([i - width/2 for i in x], weekday_vals.values, width=width, label="平日")
-        ax.bar([i + width/2 for i in x], holiday_vals.values, width=width, label="休祝日")
-        ax.set_title("月別 平日/休祝日 平均需要電力")
-        ax.set_xlabel("Month")
-        ax.set_ylabel("kW")
-        ax.set_xticks(list(x))
-        ax.set_xticklabels(months, rotation=45)
-        ax.legend()
-        fig.tight_layout()
+        fig, _ = create_grouped_bar_plot(
+            months,
+            [
+                {"label": "平日", "values": weekday_vals.values},
+                {"label": "休祝日", "values": holiday_vals.values},
+            ],
+            title="月別 平日/休祝日 平均需要電力",
+            xlabel="Month",
+            ylabel="kW",
+            figsize=(12, 5),
+            rotation=45,
+            width=0.38,
+        )
         self.draw_figure(fig)
 
     def show_monthly_time_profile(self):
@@ -618,7 +630,7 @@ class IzumiPowerAnalyzer:
             f"{'受電点' if self.show_receive_var.get() else ''}"
         )
 
-        fig, ax = plt.subplots(figsize=(13, 6))
+        series = []
         for month in selected_months:
             merged = export_df[export_df["month"] == month].copy()
             stats_row = stats_df[stats_df["month"] == month]
@@ -632,13 +644,13 @@ class IzumiPowerAnalyzer:
             )
 
             if self.show_load_var.get():
-                ax.plot(merged["time"], merged["kw"], label=f"{month} 負荷")
+                series.append({"x": merged["time"], "y": merged["kw"], "label": f"{month} 負荷"})
 
             if self.show_pv_profile_var.get():
-                ax.plot(merged["time"], merged["pv_kw"], label=f"{month} 疑似PV")
+                series.append({"x": merged["time"], "y": merged["pv_kw"], "label": f"{month} 疑似PV"})
 
             if self.show_receive_var.get():
-                ax.plot(merged["time"], merged["recv_kw"], label=f"{month} 受電点")
+                series.append({"x": merged["time"], "y": merged["recv_kw"], "label": f"{month} 受電点"})
 
         if not export_df.empty:
             self.current_plot_df = export_df[["month", "time", "kw", "pv_kw", "recv_kw"]].copy()
@@ -654,13 +666,14 @@ class IzumiPowerAnalyzer:
             self.current_plot_df = None
             self.current_plot_name = None
 
-        ax.set_title(f"月別時刻プロファイル比較（{daytype}）")
-        ax.set_xlabel("Time")
-        ax.set_ylabel("kW")
-        ax.tick_params(axis="x", rotation=90)
-        ax.grid(True)
-        ax.legend()
-        fig.tight_layout()
+        fig, _ = create_multi_line_plot(
+            series,
+            title=f"月別時刻プロファイル比較（{daytype}）",
+            xlabel="Time",
+            ylabel="kW",
+            figsize=(13, 6),
+            rotation=90,
+        )
         self.draw_figure(fig)
 
     def show_heatmap(self):
@@ -677,15 +690,15 @@ class IzumiPowerAnalyzer:
         self.log(f"行数: {pivot.shape[0]}")
         self.log(f"列数: {pivot.shape[1]}")
 
-        fig, ax = plt.subplots(figsize=(14, 6))
-        im = ax.imshow(pivot.values, aspect="auto", interpolation="nearest")
-        ax.set_title("30分値需要電力ヒートマップ")
-        ax.set_xlabel("Date")
-        ax.set_ylabel("Time")
-        ax.set_yticks(range(len(pivot.index)))
-        ax.set_yticklabels(pivot.index)
-        fig.colorbar(im, ax=ax, label="kW")
-        fig.tight_layout()
+        fig, _ = create_heatmap_plot(
+            pivot.values,
+            pivot.index,
+            title="30分値需要電力ヒートマップ",
+            xlabel="Date",
+            ylabel="Time",
+            colorbar_label="kW",
+            figsize=(14, 6),
+        )
         self.draw_figure(fig)
 
     def export_csv(self):
