@@ -1,15 +1,19 @@
 ﻿import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
-import zipfile
-import tempfile
 import pandas as pd
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib import font_manager
-import jpholiday
+from analysis_utils import (
+    build_pv_long_df,
+    get_pv_profile_for_date,
+    is_holiday_or_weekend,
+    prepare_power_views,
+)
+from data_loaders import load_dataset, load_pv_profile_dataset
 
 from db import (
     init_db,
@@ -21,8 +25,6 @@ from db import (
     pv_dataset_exists,
     insert_pv_profile_dataset,
     load_pv_profile_by_id,
-    list_pv_profile_datasets,
-    load_latest_pv_profile,
 )
 
 
@@ -42,13 +44,6 @@ def setup_matplotlib_japanese_font():
             plt.rcParams["font.family"] = font_name
             break
     plt.rcParams["axes.unicode_minus"] = False
-
-
-def is_holiday_or_weekend(ts):
-    d = pd.Timestamp(ts).date()
-    return pd.Timestamp(ts).weekday() >= 5 or jpholiday.is_holiday(d)
-
-
 class IzumiPowerAnalyzer:
     def __init__(self, root):
         self.root = root
@@ -229,16 +224,7 @@ class IzumiPowerAnalyzer:
         return [self.month_listbox.get(i) for i in idxs]
 
     def prepare_views(self):
-        self.df["datetime"] = pd.to_datetime(self.df["datetime"])
-        self.df["date_ts"] = self.df["datetime"].dt.normalize()
-        self.df["date"] = self.df["datetime"].dt.date
-        self.df["month"] = self.df["datetime"].dt.to_period("M").astype(str)
-        self.df["time"] = self.df["datetime"].dt.strftime("%H:%M")
-        self.df["kw"] = self.df["kwh"] / 0.5
-        self.df["is_holiday"] = self.df["date_ts"].apply(is_holiday_or_weekend)
-
-        self.daily_df = self._create_daily_totals(self.df)
-        self.monthly_df = self._create_monthly_totals(self.daily_df)
+        self.df, self.daily_df, self.monthly_df = prepare_power_views(self.df)
         self.refresh_month_listbox()
 
     def load_file(self):
@@ -277,7 +263,7 @@ class IzumiPowerAnalyzer:
                 return
 
             self.current_file = path
-            self.df = self._load_dataset(Path(path))
+            self.df = load_dataset(Path(path))
             self.prepare_views()
 
             dataset_id = insert_dataset(Path(path).name, file_hash, self.df)
@@ -319,7 +305,10 @@ class IzumiPowerAnalyzer:
                 self.pv_norm_df = load_pv_profile_by_id(dataset_id)
                 self.current_pv_dataset_id = dataset_id
                 self.pv_profile_file = source_name
-                self.pv_time_cols = [c for c in self.pv_norm_df.columns if c not in ["月", "日"]]
+                self.pv_time_cols = sorted(
+                    [c for c in self.pv_norm_df.columns if c not in ["月", "日"]],
+                    key=lambda x: pd.to_datetime(x, format="%H:%M", errors="coerce")
+                )
 
                 self.log("=== PV既存DB読込 ===")
                 self.log(f"id={dataset_id} file={source_name}")
@@ -327,9 +316,12 @@ class IzumiPowerAnalyzer:
                 return
 
             # 新規読込
-            self.pv_norm_df = self._load_pv_profile_dataset(Path(path))
+            self.pv_norm_df = load_pv_profile_dataset(Path(path))
             self.pv_profile_file = path
-            self.pv_time_cols = [c for c in self.pv_norm_df.columns if c not in ["月", "日"]]
+            self.pv_time_cols = sorted(
+                [c for c in self.pv_norm_df.columns if c not in ["月", "日"]],
+                key=lambda x: pd.to_datetime(x, format="%H:%M", errors="coerce")
+            )
 
             dataset_id = insert_pv_profile_dataset(
                 Path(path).name,
@@ -392,241 +384,11 @@ class IzumiPowerAnalyzer:
         except Exception as e:
             messagebox.showerror("DB読込エラー", str(e))
 
-    def _load_dataset(self, path: Path):
-        if path.suffix.lower() == ".zip":
-            with tempfile.TemporaryDirectory() as td:
-                with zipfile.ZipFile(path, "r") as zf:
-                    xlsx_list = [n for n in zf.namelist() if n.lower().endswith(".xlsx")]
-                    if not xlsx_list:
-                        raise ValueError("ZIP内にxlsxが見つかりません。")
-                    xlsx_name = xlsx_list[0]
-                    zf.extract(xlsx_name, td)
-                    xlsx_path = Path(td) / xlsx_name
-                    return self._load_excel(xlsx_path)
-        elif path.suffix.lower() == ".xlsx":
-            return self._load_excel(path)
-        else:
-            raise ValueError("対応形式は .xlsx または .zip です。")
-
-    def _load_pv_profile_dataset(self, path: Path):
-        if path.suffix.lower() == ".zip":
-            with tempfile.TemporaryDirectory() as td:
-                with zipfile.ZipFile(path, "r") as zf:
-                    csv_list = [n for n in zf.namelist() if n.lower().endswith(".csv")]
-                    if not csv_list:
-                        raise ValueError("ZIP内にCSVが見つかりません。")
-                    csv_name = csv_list[0]
-                    zf.extract(csv_name, td)
-                    csv_path = Path(td) / csv_name
-                    return self._load_pv_profile_csv(csv_path)
-        elif path.suffix.lower() == ".csv":
-            return self._load_pv_profile_csv(path)
-        else:
-            raise ValueError("PVプロファイルは .csv または .zip に対応しています。")
-
-    def _load_pv_profile_csv(self, path: Path):
-        df = pd.read_csv(path)
-
-        required = {"月", "日"}
-        if not required.issubset(df.columns):
-            raise ValueError("PVプロファイルCSVには '月' と '日' 列が必要です。")
-
-        time_cols = [c for c in df.columns if c not in ["月", "日"]]
-        if len(time_cols) != 48:
-            raise ValueError(f"PVプロファイルCSVの時刻列は48個必要です。現在: {len(time_cols)} 個")
-
-        normalized_map = {}
-        for c in time_cols:
-            try:
-                t = pd.to_datetime(str(c), format="%H:%M", errors="raise")
-                normalized_map[c] = t.strftime("%H:%M")
-            except Exception:
-                try:
-                    hh, mm = str(c).split(":")
-                    normalized_map[c] = f"{int(hh):02d}:{int(mm):02d}"
-                except Exception:
-                    raise ValueError(f"時刻列の形式が不正です: {c}")
-
-        df = df.rename(columns=normalized_map)
-
-        self.pv_time_cols = sorted(
-            [c for c in df.columns if c not in ["月", "日"]],
-            key=lambda x: pd.to_datetime(x, format="%H:%M", errors="coerce")
-        )
-
-        df["月"] = pd.to_numeric(df["月"], errors="coerce").astype("Int64")
-        df["日"] = pd.to_numeric(df["日"], errors="coerce").astype("Int64")
-
-        for c in self.pv_time_cols:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-
-        df = df.dropna(subset=["月", "日"]).copy()
-        df["月"] = df["月"].astype(int)
-        df["日"] = df["日"].astype(int)
-
-        return df
-
-    def _load_excel(self, path: Path):
-        xls = pd.ExcelFile(path)
-        sheet = xls.sheet_names[0]
-        raw = pd.read_excel(path, sheet_name=sheet, header=None)
-
-        records = []
-        nrows, ncols = raw.shape
-        r = 0
-
-        while r < nrows:
-            row = raw.iloc[r]
-
-            candidate_dates = []
-            for c in range(1, ncols):
-                v = row.iloc[c]
-                try:
-                    if pd.notna(v):
-                        d = pd.to_datetime(v)
-                        if d.year >= 2024 and d.year <= 2030:
-                            candidate_dates.append((c, d.date()))
-                except:
-                    pass
-
-            if len(candidate_dates) >= 5:
-                valid_cols = [c for c, _ in candidate_dates]
-                valid_dates = [d for _, d in candidate_dates]
-
-                for rr in range(r + 1, min(r + 49, nrows)):
-                    t = raw.iloc[rr, 0]
-                    if pd.isna(t):
-                        continue
-
-                    t_str = str(t).strip()
-                    if ":" not in t_str:
-                        continue
-
-                    for idx, c in enumerate(valid_cols):
-                        v = raw.iloc[rr, c]
-                        if pd.isna(v):
-                            continue
-                        try:
-                            d = valid_dates[idx]
-                            if t_str == "24:00":
-                                dt = pd.Timestamp(d) + pd.Timedelta(days=1)
-                            else:
-                                hh, mm = t_str.split(":")
-                                dt = pd.Timestamp(
-                                    year=d.year,
-                                    month=d.month,
-                                    day=d.day,
-                                    hour=int(hh),
-                                    minute=int(mm)
-                                )
-                            records.append([dt, float(v)])
-                        except:
-                            continue
-
-                r += 49
-                continue
-
-            r += 1
-
-        if not records:
-            raise ValueError("30分値データを抽出できませんでした。")
-
-        df = pd.DataFrame(records, columns=["datetime", "kwh"])
-        df["datetime"] = pd.to_datetime(df["datetime"])
-        df = df.drop_duplicates(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
-        return df
-
-    def _create_daily_totals(self, df):
-        daily = df.groupby("date_ts", as_index=False)["kwh"].sum()
-        daily["date"] = daily["date_ts"].dt.date
-        daily["month"] = daily["date_ts"].dt.to_period("M").astype(str)
-        daily["is_holiday"] = daily["date_ts"].apply(is_holiday_or_weekend)
-        return daily
-
-    def _create_monthly_totals(self, daily_df):
-        monthly = daily_df.groupby("month", as_index=False)["kwh"].sum()
-        monthly["month_dt"] = pd.to_datetime(monthly["month"] + "-01")
-        monthly = monthly.sort_values("month_dt").reset_index(drop=True)
-        return monthly
-
     def require_data(self):
         if self.df is None:
             messagebox.showwarning("未読込", "先にExcel/ZIP読込またはDB読込を行ってください。")
             return False
         return True
-
-
-    def build_pv_long_df(self):
-        if self.pv_norm_df is None or self.pv_norm_df.empty:
-            return pd.DataFrame()
-
-        try:
-            factor = float(self.pv_factor_var.get())
-        except Exception:
-            factor = 100.0
-            self.pv_factor_var.set(factor)
-
-        time_cols = [c for c in self.pv_norm_df.columns if c not in ["月", "日"]]
-        records = []
-
-        for _, row in self.pv_norm_df.iterrows():
-            month = int(row["月"])
-            day = int(row["日"])
-
-            try:
-                dt0 = pd.Timestamp(year=2025, month=month, day=day)
-            except Exception:
-                continue
-
-            is_holiday = is_holiday_or_weekend(dt0)
-
-            for t in time_cols:
-                try:
-                    pv_kw = float(row[t]) * factor
-                except Exception:
-                    pv_kw = 0.0
-
-                records.append({
-                    "month_num": month,
-                    "month": f"2025-{month:02d}",
-                    "day": day,
-                    "time": t,
-                    "pv_kw": pv_kw,
-                    "is_holiday": is_holiday,
-                })
-
-        pv_long = pd.DataFrame(records)
-        if pv_long.empty:
-            return pv_long
-
-        pv_long["sort_key"] = pd.to_datetime(pv_long["time"], format="%H:%M", errors="coerce")
-        return pv_long
-
-    def get_pv_profile_for_date(self, target_date):
-        if self.pv_norm_df is None:
-            return None
-
-        month = target_date.month
-        day = target_date.day
-
-        row = self.pv_norm_df[
-            (self.pv_norm_df["月"] == month) & (self.pv_norm_df["日"] == day)
-        ]
-
-        if row.empty:
-            return None
-
-        try:
-            factor = float(self.pv_factor_var.get())
-        except Exception:
-            factor = 100.0
-            self.pv_factor_var.set(factor)
-
-        values = row.iloc[0][self.pv_time_cols].astype(float).values * factor
-        return pd.DataFrame({
-            "time": self.pv_time_cols,
-            "pv_kw": values
-        })
 
     def show_summary(self):
         if not self.require_data():
@@ -725,7 +487,12 @@ class IzumiPowerAnalyzer:
         merged = work[["time", "kw", "kwh"]].copy()
 
         if self.use_pv_var.get() and self.pv_norm_df is not None:
-            pv_df = self.get_pv_profile_for_date(target_date)
+            pv_df = get_pv_profile_for_date(
+                self.pv_norm_df,
+                self.pv_time_cols,
+                target_date,
+                float(self.pv_factor_var.get()),
+            )
             if pv_df is not None:
                 merged = merged.merge(pv_df, on="time", how="left")
                 merged["pv_kw"] = merged["pv_kw"].fillna(0.0)
@@ -881,7 +648,7 @@ class IzumiPowerAnalyzer:
 
         pv_profile = pd.DataFrame(columns=["month", "time", "pv_kw", "sort_key"])
         if self.pv_norm_df is not None and not self.pv_norm_df.empty:
-            pv_long = self.build_pv_long_df()
+            pv_long = build_pv_long_df(self.pv_norm_df, float(self.pv_factor_var.get()))
 
             if not pv_long.empty:
                 if daytype == "平日":
@@ -1040,7 +807,12 @@ class IzumiPowerAnalyzer:
                     day_df = day_df.sort_values("sort_key")[["datetime", "date", "time", "kwh", "kw"]].copy()
 
                     if self.use_pv_var.get() and self.pv_norm_df is not None:
-                        pv_df = self.get_pv_profile_for_date(target_date)
+                        pv_df = get_pv_profile_for_date(
+                            self.pv_norm_df,
+                            self.pv_time_cols,
+                            target_date,
+                            float(self.pv_factor_var.get()),
+                        )
                         if pv_df is not None:
                             day_df = day_df.merge(pv_df, on="time", how="left")
                             day_df["pv_kw"] = day_df["pv_kw"].fillna(0.0)
