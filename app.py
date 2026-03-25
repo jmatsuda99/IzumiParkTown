@@ -8,10 +8,9 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib import font_manager
 from analysis_utils import (
-    build_pv_long_df,
-    get_pv_profile_for_date,
-    is_holiday_or_weekend,
-    merge_pv_into_time_series,
+    build_export_frames,
+    build_monthly_time_profile_data,
+    build_selected_day_data,
     prepare_power_views,
 )
 from data_loaders import load_dataset, load_pv_profile_dataset
@@ -471,52 +470,33 @@ class IzumiPowerAnalyzer:
             messagebox.showerror("日付エラー", "日付形式は YYYY-MM-DD で入力してください。")
             return
 
-        work = self.df[self.df["date"] == target_date].copy()
-        if work.empty:
+        merged, summary = build_selected_day_data(
+            self.df,
+            target_date,
+            self.pv_norm_df,
+            self.pv_time_cols,
+            float(self.pv_factor_var.get()),
+            self.use_pv_var.get(),
+        )
+        if merged is None or summary is None:
             messagebox.showwarning("データなし", f"{date_str} のデータはありません。")
             return
 
-        work["sort_key"] = pd.to_datetime(work["time"], format="%H:%M", errors="coerce")
-        work = work.sort_values("sort_key")
-
-        day_total_kwh = work["kwh"].sum()
-        day_avg_kw = work["kw"].mean()
-        day_max_kw = work["kw"].max()
-        holiday_label = "休祝日" if is_holiday_or_weekend(pd.Timestamp(target_date)) else "平日"
-
-        pv_df = None
-        merged = work[["time", "kw", "kwh"]].copy()
-
-        if self.use_pv_var.get() and self.pv_norm_df is not None:
-            pv_df = get_pv_profile_for_date(
-                self.pv_norm_df,
-                self.pv_time_cols,
-                target_date,
-                float(self.pv_factor_var.get()),
-            )
-
-        merged = merge_pv_into_time_series(merged, pv_df)
-
-        pv_total_kwh = merged["pv_kwh"].sum()
-        pv_max_kw = merged["pv_kw"].max()
-        net_total_kwh = merged["net_kwh"].sum()
-        net_max_kw = merged["net_kw"].max()
-
         self.text.delete("1.0", "end")
         self.log(f"=== 指定日グラフ: {date_str} ===")
-        self.log(f"区分: {holiday_label}")
-        self.log(f"日使用電力量: {day_total_kwh:,.1f} kWh")
-        self.log(f"平均需要電力: {day_avg_kw:,.2f} kW")
-        self.log(f"最大需要電力: {day_max_kw:,.2f} kW")
+        self.log(f"区分: {summary['holiday_label']}")
+        self.log(f"日使用電力量: {summary['day_total_kwh']:,.1f} kWh")
+        self.log(f"平均需要電力: {summary['day_avg_kw']:,.2f} kW")
+        self.log(f"最大需要電力: {summary['day_max_kw']:,.2f} kW")
 
         if self.use_pv_var.get() and self.pv_norm_df is not None:
             self.log(f"PV係数: {float(self.pv_factor_var.get()):,.2f}")
-            self.log(f"疑似PV発電量: {pv_total_kwh:,.1f} kWh")
-            self.log(f"疑似PV最大出力: {pv_max_kw:,.2f} kW")
-            self.log(f"差引後ネット電力量: {net_total_kwh:,.1f} kWh")
-            self.log(f"差引後ネット最大需要: {net_max_kw:,.2f} kW")
+            self.log(f"疑似PV発電量: {summary['pv_total_kwh']:,.1f} kWh")
+            self.log(f"疑似PV最大出力: {summary['pv_max_kw']:,.2f} kW")
+            self.log(f"差引後ネット電力量: {summary['net_total_kwh']:,.1f} kWh")
+            self.log(f"差引後ネット最大需要: {summary['net_max_kw']:,.2f} kW")
 
-            if pv_df is None:
+            if not summary["pv_applied"]:
                 self.log("※ PVプロファイルに該当する月日がないため、PVは反映されていません。")
 
         self.current_plot_df = merged[["time", "kw", "pv_kw", "net_kw"]].copy()
@@ -619,38 +599,13 @@ class IzumiPowerAnalyzer:
             return
 
         daytype = self.daytype_var.get()
-
-        load_work = self.df.copy()
-        if daytype == "平日":
-            load_work = load_work[load_work["is_holiday"] == False]
-        elif daytype == "休祝日":
-            load_work = load_work[load_work["is_holiday"] == True]
-        load_work = load_work[load_work["month"].isin(selected_months)].copy()
-
-        load_profile = (
-            load_work.groupby(["month", "time"], as_index=False)["kw"]
-            .mean()
+        export_df, stats_df = build_monthly_time_profile_data(
+            self.df,
+            selected_months,
+            daytype,
+            self.pv_norm_df,
+            float(self.pv_factor_var.get()),
         )
-        load_profile["sort_key"] = pd.to_datetime(load_profile["time"], format="%H:%M", errors="coerce")
-
-        pv_profile = pd.DataFrame(columns=["month", "time", "pv_kw", "sort_key"])
-        if self.pv_norm_df is not None and not self.pv_norm_df.empty:
-            pv_long = build_pv_long_df(self.pv_norm_df, float(self.pv_factor_var.get()))
-
-            if not pv_long.empty:
-                if daytype == "平日":
-                    pv_long = pv_long[pv_long["is_holiday"] == False]
-                elif daytype == "休祝日":
-                    pv_long = pv_long[pv_long["is_holiday"] == True]
-
-                pv_long = pv_long[pv_long["month"].isin(selected_months)].copy()
-
-                if not pv_long.empty:
-                    pv_profile = (
-                        pv_long.groupby(["month", "time"], as_index=False)["pv_kw"]
-                        .mean()
-                    )
-                    pv_profile["sort_key"] = pd.to_datetime(pv_profile["time"], format="%H:%M", errors="coerce")
 
         self.text.delete("1.0", "end")
         self.log("=== 月別時刻プロファイル比較 ===")
@@ -664,35 +619,17 @@ class IzumiPowerAnalyzer:
         )
 
         fig, ax = plt.subplots(figsize=(13, 6))
-        export_rows = []
-
         for month in selected_months:
-            load_sub = load_profile[load_profile["month"] == month].copy().sort_values("sort_key")
-            pv_sub = pv_profile[pv_profile["month"] == month].copy().sort_values("sort_key")
-
-            merged = pd.merge(
-                load_sub[["time", "kw", "sort_key"]],
-                pv_sub[["time", "pv_kw"]],
-                on="time",
-                how="left"
-            )
-            merged = merge_pv_into_time_series(merged, None)
-            merged = merged.rename(columns={"net_kw": "recv_kw", "net_kwh": "recv_kwh"})
-            merged = merged.sort_values("sort_key")
-
-            load_mean = merged["kw"].mean() if not merged.empty else 0.0
-            pv_mean = merged["pv_kw"].mean() if not merged.empty else 0.0
-            recv_mean = merged["recv_kw"].mean() if not merged.empty else 0.0
-
+            merged = export_df[export_df["month"] == month].copy()
+            stats_row = stats_df[stats_df["month"] == month]
+            load_mean = float(stats_row.iloc[0]["load_mean"]) if not stats_row.empty else 0.0
+            pv_mean = float(stats_row.iloc[0]["pv_mean"]) if not stats_row.empty else 0.0
+            recv_mean = float(stats_row.iloc[0]["recv_mean"]) if not stats_row.empty else 0.0
             self.log(
                 f"{month} | 負荷平均: {load_mean:,.2f} kW | "
                 f"疑似PV平均: {pv_mean:,.2f} kW | "
                 f"受電点平均: {recv_mean:,.2f} kW"
             )
-
-            export_sub = merged[["time", "kw", "pv_kw", "recv_kw"]].copy()
-            export_sub["month"] = month
-            export_rows.append(export_sub[["month", "time", "kw", "pv_kw", "recv_kw"]])
 
             if self.show_load_var.get():
                 ax.plot(merged["time"], merged["kw"], label=f"{month} 負荷")
@@ -703,8 +640,8 @@ class IzumiPowerAnalyzer:
             if self.show_receive_var.get():
                 ax.plot(merged["time"], merged["recv_kw"], label=f"{month} 受電点")
 
-        if export_rows:
-            self.current_plot_df = pd.concat(export_rows, ignore_index=True)
+        if not export_df.empty:
+            self.current_plot_df = export_df[["month", "time", "kw", "pv_kw", "recv_kw"]].copy()
             self.current_plot_df = self.current_plot_df.rename(columns={
                 "month": "月",
                 "time": "時刻",
@@ -757,53 +694,31 @@ class IzumiPowerAnalyzer:
 
         out_dir = Path("output")
         out_dir.mkdir(exist_ok=True)
+        export_frames = build_export_frames(self.df, self.daily_df, self.monthly_df)
 
-        export_df = self.df.copy()
-
-        export_daily = self.daily_df.copy()
-        export_daily["avg_kw"] = (export_daily["kwh"] / 48.0) / 0.5
-
-        monthly_daytype = self.daily_df.copy()
-        monthly_daytype["day_type"] = monthly_daytype["is_holiday"].map({False: "平日", True: "休祝日"})
-        monthly_daytype = (
-            monthly_daytype.groupby(["month", "day_type"], as_index=False)["kwh"]
-            .mean()
-            .rename(columns={"kwh": "avg_kwh_per_day"})
+        export_frames["long_df"].to_csv(out_dir / "izumi_30min_long_with_kw.csv", index=False, encoding="utf-8-sig")
+        export_frames["daily_df"].to_csv(out_dir / "izumi_daily_totals.csv", index=False, encoding="utf-8-sig")
+        export_frames["monthly_df"].to_csv(out_dir / "izumi_monthly_totals.csv", index=False, encoding="utf-8-sig")
+        export_frames["monthly_daytype_df"].to_csv(
+            out_dir / "izumi_monthly_weekday_holiday_avg.csv", index=False, encoding="utf-8-sig"
         )
-        monthly_daytype["avg_kw"] = (monthly_daytype["avg_kwh_per_day"] / 48.0) / 0.5
-
-        monthly_time_profile = (
-            self.df.groupby(["month", "is_holiday", "time"], as_index=False)["kw"]
-            .mean()
+        export_frames["monthly_time_profile_df"].to_csv(
+            out_dir / "izumi_monthly_time_profile.csv", index=False, encoding="utf-8-sig"
         )
-        monthly_time_profile["day_type"] = monthly_time_profile["is_holiday"].map({False: "平日", True: "休祝日"})
-
-        export_df.to_csv(out_dir / "izumi_30min_long_with_kw.csv", index=False, encoding="utf-8-sig")
-        export_daily.to_csv(out_dir / "izumi_daily_totals.csv", index=False, encoding="utf-8-sig")
-        self.monthly_df.to_csv(out_dir / "izumi_monthly_totals.csv", index=False, encoding="utf-8-sig")
-        monthly_daytype.to_csv(out_dir / "izumi_monthly_weekday_holiday_avg.csv", index=False, encoding="utf-8-sig")
-        monthly_time_profile.to_csv(out_dir / "izumi_monthly_time_profile.csv", index=False, encoding="utf-8-sig")
 
         date_str = self.date_entry.get().strip()
         if date_str:
             try:
                 target_date = pd.to_datetime(date_str).date()
-                day_df = self.df[self.df["date"] == target_date].copy()
-                if not day_df.empty:
-                    day_df["sort_key"] = pd.to_datetime(day_df["time"], format="%H:%M", errors="coerce")
-                    day_df = day_df.sort_values("sort_key")[["datetime", "date", "time", "kwh", "kw"]].copy()
-
-                    pv_df = None
-                    if self.use_pv_var.get() and self.pv_norm_df is not None:
-                        pv_df = get_pv_profile_for_date(
-                            self.pv_norm_df,
-                            self.pv_time_cols,
-                            target_date,
-                            float(self.pv_factor_var.get()),
-                        )
-
-                    day_df = merge_pv_into_time_series(day_df, pv_df)
-
+                day_df, _ = build_selected_day_data(
+                    self.df,
+                    target_date,
+                    self.pv_norm_df,
+                    self.pv_time_cols,
+                    float(self.pv_factor_var.get()),
+                    self.use_pv_var.get(),
+                )
+                if day_df is not None:
                     out_name = f"izumi_selected_day_with_pv_{target_date.strftime('%Y%m%d')}.csv"
                     day_df.to_csv(out_dir / out_name, index=False, encoding="utf-8-sig")
             except Exception:
